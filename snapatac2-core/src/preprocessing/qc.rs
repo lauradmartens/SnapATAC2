@@ -11,7 +11,7 @@ pub type CellBarcode = String;
 
 /// Fragments from single-cell ATAC-seq experiment. Each fragment is represented
 /// by a genomic coordinate, cell barcode and a integer value.
-#[derive(Serialize, Deserialize, Debug)] 
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Fragment {
     pub chrom: String,
     pub start: u64,
