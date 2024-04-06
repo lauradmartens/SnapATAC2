@@ -119,7 +119,7 @@ where
                         let row_start = row_offsets[i];
                         let row_end = row_offsets[i + 1];
                         (row_start..row_end).flat_map(|j| {
-                            let (chrom, start) = index.get_position(col_indices[j]);
+                            let (chrom, mut start) = index.get_position(col_indices[j]);
                             if self.exclude_chroms.contains(chrom) {
                                 None
                             } else {
@@ -133,6 +133,7 @@ where
                                     strand = Some(Strand::Forward);
                                 } else {
                                     end = start + 1;
+                                    start = start - (size.abs() as u64);
                                     strand = Some(Strand::Reverse);
                                 }
                                 Some(Fragment { chrom: chrom.to_string(), start, end, barcode, count, strand })
