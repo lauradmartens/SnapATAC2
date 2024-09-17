@@ -37,6 +37,7 @@ pub(crate) fn make_fragment_file(
     bam_file: PathBuf,
     output_file: PathBuf,
     is_paired: bool,
+    stranded: bool,
     shift_left: i64,
     shift_right: i64,
     chunk_size: usize,
@@ -59,11 +60,11 @@ pub(crate) fn make_fragment_file(
         }
     }
     let stat = preprocessing::make_fragment_file(
-        bam_file, output_file, is_paired,
+        bam_file, output_file, is_paired, stranded,
         barcode_tag.map(|x| parse_tag(x)), barcode_regex,
         umi_tag.map(|x| parse_tag(x)), umi_regex,
         shift_left, shift_right, mapq, chunk_size,
-        compression.map(|x| utils::Compression::from_str(x).unwrap()), compression_level, temp_dir,
+        compression.map(|x| utils::Compression::from_str(x).unwrap()), compression_level, temp_dir
     )?;
     Ok(PyFlagStat(stat))
 }

@@ -111,6 +111,7 @@ pub struct AlignmentInfo {
     sum_of_qual_scores: u32,
     barcode: Option<String>,
     umi: Option<String>,
+    skips: Option<Vec<(u64, u64)>>,
 }
 
 impl AlignmentInfo {
@@ -139,6 +140,43 @@ impl AlignmentInfo {
         } else {
             0
         });
+
+        let skips = if cigar
+            .iter()
+            .map(Result::unwrap)
+            .any(|x| x.kind() == Kind::Skip)
+        {
+            let parts: Result<Vec<_>> = cigar
+                .iter()
+                .map(Result::unwrap)
+                .filter(|op| op.kind() == Kind::Skip || op.kind() == Kind::Match)
+                .group_by(|op| op.kind())
+                .into_iter()
+                .chunks(2)
+                .into_iter()
+                .map(|mut chunk| {
+                    let (mkind, m) = chunk.next().context("No match")?;
+                    if mkind != Kind::Match {
+                        return Err(anyhow!("First chunk is not a match"));
+                    }
+                    let skip_len = match chunk.next() {
+                        Some((kind, ops)) => {
+                            if kind != Kind::Skip {
+                                return Err(anyhow!("First chunk is not a skip"));
+                            }
+                            ops.map(|x| x.len() as u64).sum()
+                        }
+                        None => 0,
+                    };
+                    let match_len = m.map(|x| x.len() as u64).sum();
+                    Ok((match_len, skip_len))
+                })
+                .collect();
+            Some(parts?)
+        } else {
+            None
+        };
+
         Ok(Self {
             name: std::str::from_utf8(rec.name().context("no read name")?.as_bytes())?.to_string(),
             reference_sequence_id: rec.reference_sequence_id().context("no reference sequence id")??.try_into()?,
@@ -150,6 +188,7 @@ impl AlignmentInfo {
             sum_of_qual_scores: sum_of_qual_score(rec),
             barcode: barcode_loc.extract(rec).ok(),
             umi: umi_loc.and_then(|x| x.extract(rec).ok()),
+            skips,
         })
     }
 
@@ -484,10 +523,16 @@ where
         result.par_sort_unstable_by(|a, b| BEDLike::compare(a, b));
         result
     } else {
-        rm_dup_single(reads).map(move |(r, c)| {
-            let ref_id: usize = r.reference_sequence_id.try_into().unwrap();
-            Fragment {
-                chrom: header.reference_sequences().get_index(ref_id).unwrap().0.to_string(),
+        let mut fragments = Vec::new();
+        for (r, c) in rm_dup_single(reads) {
+            let ref_id: usize = r.reference_sequence_id.into();
+            let frag = Fragment {
+                chrom: header
+                    .reference_sequences()
+                    .get_index(ref_id)
+                    .unwrap()
+                    .0
+                    .to_string(),
                 start: r.alignment_start as u64 - 1,
                 end: r.alignment_end as u64,
                 barcode: Some(r.barcode.as_ref().unwrap().clone()),
@@ -497,8 +542,25 @@ where
                 } else {
                     Strand::Forward
                 }),
-            }
-        }).collect()
+            };
+            match r.skips {
+                None => {
+                    fragments.push(frag);
+                }
+                Some(skips) => {
+                    let mut offset = frag.start;
+                    for (match_len, skip_len) in skips {
+                        let mut f = frag.clone();
+                        f.start = offset;
+                        f.end = offset + match_len;
+                        // Update the offset
+                        offset = f.end + skip_len;
+                        fragments.push(f);
+                    }
+                }
+            };
+        }
+        fragments
     }
 }
 
