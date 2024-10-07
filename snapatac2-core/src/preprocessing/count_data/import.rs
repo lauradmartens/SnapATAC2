@@ -62,7 +62,7 @@ where
     let mut scanned_barcodes = HashSet::new();
     let frag_grouped= fragments
         .filter(|x| x.len() > 0)
-        .group_by(|x| x.name().unwrap().to_string());
+        .chunk_by(|x| x.name().unwrap().to_string());
     let frag_chunked = frag_grouped
         .into_iter()
         .progress_with(spinner)
@@ -141,9 +141,9 @@ where
     let mut qc = FragmentSummary::new(mitochrondrial_dna);
     let mut values = Vec::new();
     fragments.into_iter().for_each(|f| {
-        qc.update(&f);
         let chrom = &f.chrom;
         if genome_index.contain_chrom(chrom) {
+            qc.update(&f);
             let start = f.start as i64;
             let end = f.end as i64;
             let size = end - start;
@@ -193,6 +193,7 @@ pub fn import_contacts<A, B, I>(
     anndata: &A,
     contacts: I,
     regions: &GenomeRegions<B>,
+    bin_size: usize,
     chunk_size: usize,
 ) -> Result<()>
 where
@@ -217,39 +218,40 @@ where
             .unwrap(),
         );
     let mut scanned_barcodes = IndexSet::new();
-    anndata.obsm().add_iter(
-        "contact",
-        contacts
-            .group_by(|x| x.barcode.clone())
-            .into_iter()
-            .progress_with(spinner)
-            .chunks(chunk_size)
-            .into_iter()
-            .map(|chunk| {
-                let data: Vec<Vec<Contact>> = chunk.map(|(barcode, x)| {
-                    if !scanned_barcodes.insert(barcode.clone()) {
-                        panic!("Please sort fragment file by barcodes");
-                    }
-                    x.collect()
-                }).collect();
+    let binding = contacts.chunk_by(|x| x.barcode.clone());
+    let binding2 = binding.into_iter().progress_with(spinner).chunks(chunk_size);
+    let binding3 = binding2
+        .into_iter()
+        .map(|chunk| {
+            let data: Vec<Vec<Contact>> = chunk.map(|(barcode, x)| {
+                if !scanned_barcodes.insert(barcode.clone()) {
+                    panic!("Please sort fragment file by barcodes");
+                }
+                x.collect()
+            }).collect();
 
-                let counts: Vec<_> = data
-                    .into_par_iter()
-                    .map(|x| {
-                        let mut count = BTreeMap::new();
-                        x.into_iter().for_each(|c| {
+            let counts: Vec<_> = data
+                .into_par_iter()
+                .map(|x| {
+                    let mut count = BTreeMap::new();
+                    x.into_iter().for_each(|c| {
+                        if genome_index.contain_chrom(&c.chrom1) && genome_index.contain_chrom(&c.chrom2) {
                             let pos1 = genome_index.get_position_rev(&c.chrom1, c.start1);
                             let pos2 = genome_index.get_position_rev(&c.chrom2, c.start2);
                             let i = pos1 * genome_size + pos2; 
                             count.entry(i).and_modify(|x| *x += c.count).or_insert(c.count);
-                        });
-                        count.into_iter().collect::<Vec<_>>()
-                    }).collect();
+                        }
+                    });
+                    count.into_iter().collect::<Vec<_>>()
+                }).collect();
 
-                let (r, c, offset, ind, data) = to_csr_data(counts, genome_size*genome_size);
-                CsrMatrix::try_from_csr_data(r, c, offset, ind, data).unwrap()
-            }),
-    )?;
+            let (r, c, offset, ind, data) = to_csr_data(counts, genome_size*genome_size);
+            CsrMatrix::try_from_csr_data(r, c, offset, ind, data).unwrap()
+        });
+    let contact_map = super::ContactMap::new(chrom_sizes, binding3).with_resolution(bin_size);
+ 
+    anndata.set_x_from_iter(contact_map.into_values::<u32>())?;
+    anndata.set_var_names(anndata.n_vars().into())?;
 
     anndata.uns().add(
         "reference_sequences",

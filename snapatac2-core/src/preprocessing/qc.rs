@@ -1,10 +1,8 @@
-use std::{io::{Read, BufRead, BufReader}, ops::Div, collections::{HashMap, HashSet}};
+use std::{io::{Read, BufRead, BufReader}, collections::{HashMap, HashSet}};
 use anndata::data::CsrNonCanonical;
 use bed_utils::bed::{GenomicRange, BEDLike, tree::BedTree, ParseError, Strand};
 use anyhow::Result;
 use serde::{Serialize, Deserialize};
-use extsort::sorter::Sortable;
-use bincode;
 use smallvec::{SmallVec, smallvec};
 
 pub type CellBarcode = String;
@@ -19,17 +17,6 @@ pub struct Fragment {
     pub barcode: Option<CellBarcode>,
     pub count: u32,
     pub strand: Option<Strand>,
-}
-
-impl Sortable for Fragment {
-    fn encode<W: std::io::Write>(&self, writer: &mut W) {
-        bincode::serialize_into(writer, self)
-            .unwrap_or_else(|e| panic!("Failed to serialize fragment: {}", e));
-    }
-
-    fn decode<R: std::io::Read>(reader: &mut R) -> Option<Self> {
-        bincode::deserialize_from(reader).ok()
-    }
 }
 
 impl Fragment {
@@ -140,17 +127,6 @@ pub struct Contact {
     pub count: u32,
 }
 
-impl Sortable for Contact {
-    fn encode<W: std::io::Write>(&self, writer: &mut W) {
-        bincode::serialize_into(writer, self)
-            .unwrap_or_else(|e| panic!("Failed to serialize fragment: {}", e));
-    }
-
-    fn decode<R: std::io::Read>(reader: &mut R) -> Option<Self> {
-        bincode::deserialize_from(reader).ok()
-    }
-}
-
 impl std::str::FromStr for Contact {
     type Err = ParseError;
 
@@ -199,10 +175,10 @@ impl<'a> FragmentSummary<'a> {
     }
 
     pub(crate) fn update(&mut self, fragment: &Fragment) {
+        self.num_total_fragment += fragment.count as u64;
         if self.mitochondrial_dna.contains(fragment.chrom.as_str()) {
             self.num_mitochondrial += 1;
         } else {
-            self.num_total_fragment += fragment.count as u64;
             self.num_unique_fragment += 1;
         }
     }
@@ -230,7 +206,9 @@ fn moving_average(half_window: usize, arr: &[u64]) -> impl Iterator<Item = f64> 
     })
 }
 
-/// Read tss from a gtf or gff file
+/// Read tss from a gtf or gff file. Note the returned result can potentially
+/// contain redudant elements as there may be multiple transcripts for the same gene
+/// in the annotation file.
 pub fn read_tss<R: Read>(file: R) -> impl Iterator<Item = (String, u64, bool)> {
     let reader = BufReader::new(file);
     reader.lines().filter_map(|line| {
@@ -260,11 +238,32 @@ pub fn read_tss<R: Read>(file: R) -> impl Iterator<Item = (String, u64, bool)> {
     })
 }
 
+pub struct TssRegions {
+    pub promoters: BedTree<bool>,
+    window_size: u64,
+}
 
-pub fn make_promoter_map<I: Iterator<Item = (String, u64, bool)>>(iter: I) -> BedTree<bool> {
+impl TssRegions {
+    /// Create a new TssRegions from an iterator of (chr, tss, is_fwd) tuples.
+    /// The promoter region is defined as |--- window_size --- TSS --- window_size ---|,
+    /// a total of 2 * window_size + 1 bp.
+    pub fn new<I: IntoIterator<Item = (String, u64, bool)>>(iter: I, window_size: u64) -> Self {
+        let promoters = iter.into_iter().map( |(chr, tss, is_fwd)| {
+            let b = GenomicRange::new(chr, tss.saturating_sub(window_size), tss + window_size + 1);
+            (b, is_fwd)
+        }).collect();
+        Self { promoters, window_size }
+    }
+
+    pub fn len(&self) -> usize {
+        2 * self.window_size as usize + 1
+    }
+}
+
+pub fn make_promoter_map<I: Iterator<Item = (String, u64, bool)>>(iter: I, half_window_size: u64) -> BedTree<bool> {
     iter
         .map( |(chr, tss, is_fwd)| {
-            let b = GenomicRange::new(chr, tss.saturating_sub(2000), tss + 2001);
+            let b = GenomicRange::new(chr, tss.saturating_sub(half_window_size), tss + half_window_size + 1);
             (b, is_fwd)
         }).collect()
 }
@@ -282,46 +281,55 @@ where
     barcodes
 }
 
-pub fn tss_enrichment<I>(fragments: I, promoter: &BedTree<bool>) -> f64
-where
-    I: Iterator<Item = Fragment>,
-{
-    fn find_pos<'a>(promoter: &'a BedTree<bool>, ins: &'a GenomicRange) -> impl Iterator<Item = usize> + 'a {
-        promoter.find(ins).map(|(entry, data)| {
-            let pos: u64 =
-                if *data {
-                    ins.start() - entry.start()
-                } else {
-                    4000 - (entry.end() - 1 - ins.start())
-                };
-            pos as usize
-        })
+pub struct TSSe<'a> {
+    promoters: &'a TssRegions,
+    counts: Vec<u64>,
+    n_overlapping: u64,
+    n_total: u64,
+}
+
+impl<'a> TSSe<'a> {
+    pub fn new(promoters: &'a TssRegions) -> Self {
+        Self { counts: vec![0; promoters.len()], n_overlapping: 0, n_total: 0, promoters }
     }
 
-    let mut counts = [0; 4001];
-    fragments.for_each(|bed| match bed.strand {
-        None => {
-            let p1 = GenomicRange::new(bed.chrom(), bed.start(), bed.start() + 1);
-            let p2 = GenomicRange::new(bed.chrom(), bed.end() - 1, bed.end());
-            find_pos(promoter, &p1).for_each(|pos| counts[pos] += 1);
-            find_pos(promoter, &p2).for_each(|pos| counts[pos] += 1);
-        },
-        Some(Strand::Forward) => {
-            let p = GenomicRange::new(bed.chrom(), bed.start(), bed.start() + 1);
-            find_pos(promoter, &p).for_each(|pos| counts[pos] += 1);
-        },
-        Some(Strand::Reverse) => {
-            let p = GenomicRange::new(bed.chrom(), bed.end() - 1, bed.end());
-            find_pos(promoter, &p).for_each(|pos| counts[pos] += 1);
-        },
-    });
-    let bg_count: f64 =
-        ( counts[ .. 100].iter().sum::<u64>() +
-        counts[3901 .. 4001].iter().sum::<u64>() ) as f64 /
-        200.0 + 0.1;
-    let tss_enrichment = moving_average(5, &counts)
-        .max_by(|a, b| a.partial_cmp(b).unwrap()).unwrap().div(bg_count);
-    tss_enrichment
+    pub fn get_counts(&self) -> &[u64] {
+        &self.counts
+    }
+
+    pub fn add(&mut self, frag: &Fragment) {
+        frag.to_insertions().into_iter().for_each(|ins| {
+            self.n_total += 1;
+            let mut overlapped = false;
+            self.promoters.promoters.find(&ins).for_each(|(promoter, is_fwd)| {
+                overlapped = true;
+                let pos = if *is_fwd {
+                        ins.start() - promoter.start()
+                    } else {
+                        promoter.end() - 1 - ins.start()
+                    };
+                self.counts[pos as usize] += 1;
+            });
+            if overlapped {
+                self.n_overlapping += 1;
+            }
+        });
+    }
+
+    pub fn add_from(&mut self, tsse: &TSSe) {
+        self.n_overlapping += tsse.n_overlapping;
+        self.n_total += tsse.n_total;
+        self.counts.iter_mut().zip(tsse.counts.iter()).for_each(|(a, b)| *a += b);
+    }
+
+    pub fn result(&self) -> (f64, f64) {
+        let counts = &self.counts;
+        let left_end_sum = counts.iter().take(100).sum::<u64>();
+        let right_end_sum = counts.iter().rev().take(100).sum::<u64>();
+        let background: f64 = (left_end_sum + right_end_sum) as f64 / 200.0 + 0.1;
+        let tss_count = moving_average(5, &counts).nth(self.promoters.window_size as usize).unwrap();
+        (tss_count / background, self.n_overlapping as f64 / self.n_total as f64)
+    }
 }
 
 /// Compute the fragment size distribution.
@@ -347,9 +355,9 @@ pub fn fragment_size_distribution<I>(data: I, max_size: usize) -> Vec<usize>
     size_dist
 }
 
-/// Count the fraction of the reads in the given regions.
+/// Count the fraction of the reads or read pairs in the given regions.
 pub fn fraction_of_reads_in_region<'a, I, D>(
-    iter: I, regions: &'a Vec<BedTree<D>>,
+    iter: I, regions: &'a Vec<BedTree<D>>, normalized: bool, count_as_insertion: bool,
 ) -> impl Iterator<Item = (Vec<Vec<f64>>, usize, usize)> + 'a
 where
     I: Iterator<Item = (Vec<Vec<Fragment>>, usize, usize)> + 'a,
@@ -359,9 +367,18 @@ where
         let frac = data.into_iter().map(|fragments| {
             let mut sum = 0.0;
             let mut counts = vec![0.0; k];
-            fragments
-                .into_iter().flat_map(|fragment| fragment.to_insertions())
-                .for_each(|read| {
+
+            if count_as_insertion {
+                fragments.into_iter().flat_map(|x| x.to_insertions()).for_each(|ins| {
+                    sum += 1.0;
+                    regions.iter().enumerate().for_each(|(i, r)|
+                        if r.is_overlapped(&ins) {
+                            counts[i] += 1.0;
+                        }
+                    )
+                });
+            } else {
+                fragments.into_iter().for_each(|read| {
                     sum += 1.0;
                     regions.iter().enumerate().for_each(|(i, r)|
                         if r.is_overlapped(&read) {
@@ -369,7 +386,11 @@ where
                         }
                     )
                 });
-            counts.iter_mut().for_each(|x| *x /= sum);
+            }
+
+            if normalized {
+                counts.iter_mut().for_each(|x| *x /= sum);
+            }
             counts
         }).collect::<Vec<_>>();
         (frac, start, end)

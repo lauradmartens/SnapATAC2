@@ -82,7 +82,7 @@ def test_make_fragment(datadir, tmp_path):
     bam = str(datadir.join('test.bam'))
     bed = str(datadir.join('test.bed.gz'))
     output = str(tmp_path) + "/out.bed.gz"
-    snap.pp.make_fragment_file(bam, output, True, barcode_regex="(^[ATCG]+):")
+    snap.pp.make_fragment_file(bam, output, True, barcode_regex="(^[ATCG]+):", chunk_size=5000)
 
     with gzip.open(bed, 'rt') as fl:
         expected = sorted(fl.readlines())
@@ -140,3 +140,23 @@ def test_import(datadir):
         outputs = snap.ex.export_fragments(data, groupby="group", out_dir=str(datadir), suffix='.bed.gz')
 
         assert read_bed(list(outputs.values())[0]) == read_bed(fl)
+
+def test_tile_matrix(datadir):
+    def total_count(adata, bin_size):
+        return snap.pp.add_tile_matrix(
+            adata,
+            bin_size=bin_size,
+            inplace=False,
+            counting_strategy='insertion',
+            ).X.sum()
+
+    data = snap.pp.import_data(
+        snap.datasets.pbmc500(downsample=True),
+        chrom_sizes=snap.genome.hg38,
+        min_num_fragments=0,
+        sorted_by_barcode=False,
+    )
+
+    counts = [total_count(data, i) for i in [500, 1000, 5000, 10000]]
+    for i in range(1, len(counts)):
+        assert counts[i] == counts[i - 1], f"Bin size {i} failed"

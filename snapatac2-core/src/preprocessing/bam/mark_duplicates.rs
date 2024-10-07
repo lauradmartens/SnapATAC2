@@ -18,25 +18,18 @@
 // if it's a PCR duplicate, it will be guaranteed to be the same at that end
 // but not at the 3' end.
 
-use noodles::{
-    bam::Record,
-    sam::{
-        alignment::record::{Cigar, Flags, data::field::{Tag, Value}, cigar::op::Kind},
-        Header,
-    },
-};
+use noodles::{bam::Record, sam::{alignment::record::data::field::{Tag, Value}, Header}};
 use bed_utils::bed::{BEDLike, Strand};
+use bed_utils::extsort::ExternalSorterBuilder;
 use std::collections::HashMap;
 use itertools::Itertools;
-use extsort::{sorter::Sortable, ExternalSorter};
-use bincode;
 use log::warn;
 use rayon::prelude::ParallelSliceMut;
-use serde::{Serialize, Deserialize};
 use anyhow::{Result, bail, anyhow, Context};
 use regex::Regex;
 
 use crate::preprocessing::Fragment;
+use crate::preprocessing::bam::flagstat::AlignmentInfo;
 
 // Library type    orientation   Vizualization according to first strand
 // FF_firststrand  matching      3' <==2==----<==1== 5'
@@ -83,8 +76,7 @@ impl BarcodeLocation {
                     _ => bail!("Not a String"),
                 },
             BarcodeLocation::Regex(re) => {
-                let read_name = rec.name().context("No read name")?;
-                let read_name = std::str::from_utf8(read_name.as_bytes())?;
+                let read_name = std::str::from_utf8(rec.name().context("No read name")?)?;
                 let mat = re.captures(read_name)
                     .and_then(|x| x.get(1))
                     .ok_or(anyhow!("The regex must contain exactly one capturing group matching the barcode"))?
@@ -97,122 +89,6 @@ impl BarcodeLocation {
         }
     }
 }
-
-/// Minimal information about an alignment extracted from the BAM record.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct AlignmentInfo {
-    name: String,
-    reference_sequence_id: u16,
-    flags: u16,
-    alignment_start: u32,
-    alignment_end: u32,
-    unclipped_start: u32,
-    unclipped_end: u32,
-    sum_of_qual_scores: u32,
-    barcode: Option<String>,
-    umi: Option<String>,
-    skips: Option<Vec<(u64, u64)>>,
-}
-
-impl AlignmentInfo {
-    fn new(
-        rec: &Record,
-        barcode_loc: &BarcodeLocation,
-        umi_loc: Option<&BarcodeLocation>,
-    ) -> Result<Self> {
-        let cigar = rec.cigar();
-        let start: usize = rec.alignment_start().unwrap().unwrap().try_into()?;
-        let alignment_start: u32 = start.try_into()?;
-        let alignment_span: u32 = cigar.alignment_span()?.try_into()?;
-        let alignment_end = alignment_start + alignment_span - 1;
-        let clip_groups = cigar.iter().map(Result::unwrap).group_by(|op| {
-            let kind = op.kind();
-            kind == Kind::HardClip || kind == Kind::SoftClip
-        });
-        let mut clips = clip_groups.into_iter();
-        let clipped_start: u32 = clips.next().map_or(0, |(is_clip, x)| if is_clip {
-            x.map(|x| x.len() as u32).sum()
-        } else {
-            0
-        });
-        let clipped_end: u32 = clips.last().map_or(0, |(is_clip, x)| if is_clip {
-            x.map(|x| x.len() as u32).sum()
-        } else {
-            0
-        });
-
-        let skips = if cigar
-            .iter()
-            .map(Result::unwrap)
-            .any(|x| x.kind() == Kind::Skip)
-        {
-            let parts: Result<Vec<_>> = cigar
-                .iter()
-                .map(Result::unwrap)
-                .filter(|op| op.kind() == Kind::Skip || op.kind() == Kind::Match)
-                .group_by(|op| op.kind())
-                .into_iter()
-                .chunks(2)
-                .into_iter()
-                .map(|mut chunk| {
-                    let (mkind, m) = chunk.next().context("No match")?;
-                    if mkind != Kind::Match {
-                        return Err(anyhow!("First chunk is not a match"));
-                    }
-                    let skip_len = match chunk.next() {
-                        Some((kind, ops)) => {
-                            if kind != Kind::Skip {
-                                return Err(anyhow!("First chunk is not a skip"));
-                            }
-                            ops.map(|x| x.len() as u64).sum()
-                        }
-                        None => 0,
-                    };
-                    let match_len = m.map(|x| x.len() as u64).sum();
-                    Ok((match_len, skip_len))
-                })
-                .collect();
-            Some(parts?)
-        } else {
-            None
-        };
-
-        Ok(Self {
-            name: std::str::from_utf8(rec.name().context("no read name")?.as_bytes())?.to_string(),
-            reference_sequence_id: rec.reference_sequence_id().context("no reference sequence id")??.try_into()?,
-            flags: rec.flags().bits(),
-            alignment_start,
-            alignment_end,
-            unclipped_start: alignment_start - clipped_start,
-            unclipped_end: alignment_end + clipped_end,
-            sum_of_qual_scores: sum_of_qual_score(rec),
-            barcode: barcode_loc.extract(rec).ok(),
-            umi: umi_loc.and_then(|x| x.extract(rec).ok()),
-            skips,
-        })
-    }
-
-    fn flags(&self) -> Flags { Flags::from_bits_retain(self.flags) }
-
-    fn alignment_5p(&self) -> u32 {
-        if self.flags().is_reverse_complemented() {
-            self.alignment_end
-        } else {
-            self.alignment_start
-        }
-    }
-}
-
-impl Sortable for AlignmentInfo {
-    fn encode<W: std::io::Write>(&self, writer: &mut W) {
-        bincode::serialize_into(writer, self).unwrap();
-    }
-
-    fn decode<R: std::io::Read>(reader: &mut R) -> Option<Self> {
-        bincode::deserialize_from(reader).ok()
-    }
-}
-
 
 /// Reads are considered duplicates if and only if they have the same fingerprint.
 #[derive(Eq, PartialEq, Debug, Hash)]
@@ -310,166 +186,32 @@ impl FingerPrint {
     }
 }
 
-/// BAM record statistics.
-#[derive(Debug, Default)]
-pub struct FlagStat {
-    pub read: u64,
-    pub primary: u64,
-    pub secondary: u64,
-    pub supplementary: u64,
-    pub duplicate: u64,
-    pub primary_duplicate: u64,
-    pub mapped: u64,
-    pub primary_mapped: u64,
-    pub paired: u64,
-    pub read_1: u64,
-    pub read_2: u64,
-    pub proper_pair: u64,
-    pub mate_mapped: u64,
-    pub singleton: u64,
-    pub mate_reference_sequence_id_mismatch: u64,
-    pub mate_reference_sequence_id_mismatch_hq: u64,
-}
-
-impl FlagStat {
-    pub fn update(&mut self, record: &Record) {
-        let flags = record.flags();
-
-        self.read += 1;
-
-        if !flags.is_unmapped() {
-            self.mapped += 1;
-        }
-
-        if flags.is_duplicate() {
-            self.duplicate += 1;
-        }
-
-        if flags.is_secondary() {
-            self.secondary += 1;
-        } else if flags.is_supplementary() {
-            self.supplementary += 1;
-        } else {
-            self.primary += 1;
-
-            if !flags.is_unmapped() {
-                self.primary_mapped += 1;
-            }
-
-            if flags.is_duplicate() {
-                self.primary_duplicate += 1;
-            }
-
-            if flags.is_segmented() {
-                self.paired += 1;
-
-                if flags.is_first_segment() {
-                    self.read_1 += 1;
-                }
-
-                if flags.is_last_segment() {
-                    self.read_2 += 1;
-                }
-
-                if !flags.is_unmapped() {
-                    if flags.is_properly_aligned() {
-                        self.proper_pair += 1;
-                    }
-
-                    if flags.is_mate_unmapped() {
-                        self.singleton += 1;
-                    } else {
-                        self.mate_mapped += 1;
-                        let rec_id = record.mate_reference_sequence_id().unwrap().unwrap(); 
-                        let mat_id = record.reference_sequence_id().unwrap().unwrap(); 
-
-                        if mat_id != rec_id {
-                            self.mate_reference_sequence_id_mismatch += 1;
-
-                            let mapq = record
-                                .mapping_quality()
-                                .map_or(255, |x| x.get());
-
-                            if mapq >= 5 {
-                                self.mate_reference_sequence_id_mismatch_hq += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Filter Bam records.
-pub fn filter_bam<'a, I>(
-    reads: I,
-    is_paired: bool,
-    mapq_filter: Option<u8>,
-    flagstat: &'a mut FlagStat,
-) -> impl Iterator<Item = Record> + 'a
-where
-    I: Iterator<Item = Record> + 'a,
-{
-    // flag (1804) meaning:
-    //   - read unmapped
-    //   - mate unmapped
-    //   - not primary alignment
-    //   - read fails platform/vendor quality checks
-    //   - read is PCR or optical duplicate
-    let flag_failed = Flags::from_bits(1804).unwrap();
-    reads.filter(move |r| {
-        flagstat.update(r);
-        let flag = r.flags();
-        let is_properly_aligned = !flag.is_supplementary() &&
-            (!is_paired || flag.is_properly_aligned());
-        let flag_pass = !flag.intersects(flag_failed);
-        let mapq_pass = mapq_filter.map_or(true, |min_q| {
-            let q = r.mapping_quality().map_or(255, |x| x.get());
-            q >= min_q
-        });
-        is_properly_aligned && flag_pass && mapq_pass
-    })
-}
-
 /// Sort and group BAM
-pub fn group_bam_by_barcode<'a, I>(
+pub fn group_bam_by_barcode<I, P>(
     reads: I,
-    barcode_loc: &'a BarcodeLocation,
-    umi_loc: Option<&'a BarcodeLocation>,
     is_paired: bool,
-    sort_dir: std::path::PathBuf,
+    temp_dir: Option<P>,
     chunk_size: usize,
-) -> RecordGroups< 
-    impl Iterator<Item = AlignmentInfo> + 'a,
-    impl FnMut(&AlignmentInfo) -> String + 'a
->
+) -> RecordGroups<impl Iterator<Item = AlignmentInfo>, impl FnMut(&AlignmentInfo) -> String>
 where
-    I: Iterator<Item = Record> + 'a,
+    I: Iterator<Item = AlignmentInfo>,
+    P: AsRef<std::path::Path>,
 {
-    fn sort_rec<I>(reads: I, tmp_dir: std::path::PathBuf, chunk: usize) -> impl Iterator<Item = AlignmentInfo>
-    where
-        I: Iterator<Item = AlignmentInfo>,
-    {
-        ExternalSorter::new()
-            .with_segment_size(chunk)
-            .with_sort_dir(tmp_dir)
-            .with_parallel_sort()
-            .sort_by(reads, |a, b| a.barcode.cmp(&b.barcode)
-                .then_with(|| a.unclipped_start.cmp(&b.unclipped_start))
-                .then_with(|| a.unclipped_end.cmp(&b.unclipped_end))
-            ).unwrap()
+    let mut sorter = ExternalSorterBuilder::new()
+        .with_chunk_size(chunk_size)
+        .with_compression(2);
+    if let Some(tmp) = temp_dir {
+        sorter = sorter.with_tmp_dir(tmp);
     }
+    let groups = sorter.build().unwrap()
+        .sort_by(reads.map(|x| std::io::Result::Ok(x)), |a, b| a.barcode.cmp(&b.barcode)
+            .then_with(|| a.unclipped_start.cmp(&b.unclipped_start))
+            .then_with(|| a.unclipped_end.cmp(&b.unclipped_end))
+        ).unwrap()
+        .map(|x| x.unwrap())
+        .chunk_by(|x| x.barcode.as_ref().unwrap().clone());
 
-    RecordGroups {
-        is_paired,
-        groups: sort_rec(
-            reads.map(move |x| AlignmentInfo::new(&x, barcode_loc, umi_loc).unwrap())
-                .filter(|x| x.barcode.is_some()),
-            sort_dir,
-            chunk_size,
-        ).group_by(|x| x.barcode.as_ref().unwrap().clone()),
-    }
+    RecordGroups {is_paired, groups}
 }
 
 pub struct RecordGroups<I, F>
@@ -478,7 +220,7 @@ pub struct RecordGroups<I, F>
         F: FnMut(&AlignmentInfo) -> String,
 {
     is_paired:  bool,
-    groups: itertools::GroupBy<String, I, F>,
+    groups: itertools::ChunkBy<String, I, F>,
 }
 
 impl<I, F> RecordGroups<I, F>
@@ -486,8 +228,8 @@ where
     I: Iterator<Item = AlignmentInfo>,
     F: FnMut(&AlignmentInfo) -> String,
 {
-    pub fn into_fragments<'a>(&'a self, header: &'a Header) -> impl Iterator<Item = Fragment> + '_ {
-        self.groups.into_iter().flat_map(|(_, rec)| get_unique_fragments(rec, header, self.is_paired))
+    pub fn into_fragments<'a>(&'a self, header: &'a Header) -> impl Iterator<Item = Vec<Fragment>> + '_ {
+        self.groups.into_iter().map(|(_, rec)| get_unique_fragments(rec, header, self.is_paired))
     }
 }
 
@@ -629,10 +371,4 @@ where
     });
     
     result.into_values().map(|x| (x.0, x.2, x.4))
-}
-
-// The sum of all base qualities in the record above 15.
-fn sum_of_qual_score(read: &Record) -> u32 {
-    read.quality_scores().as_ref().iter().map(|x| u8::from(*x) as u32)
-        .filter(|x| *x >= 15).sum()
 }

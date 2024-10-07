@@ -7,7 +7,7 @@ mod network;
 mod motif;
 mod knn;
 
-use pyo3::{prelude::*, PyResult, Python};
+use pyo3::{prelude::*, PyResult};
 use pyanndata;
 
 #[cfg(not(target_env = "msvc"))]
@@ -18,7 +18,7 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 #[pymodule]
-fn _snapatac2(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _snapatac2(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_log::init();
 
     // AnnData related functions
@@ -37,7 +37,6 @@ fn _snapatac2(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(motif::read_motifs, m)?)?;
  
     // Preprocessing related functions
-    m.add_class::<preprocessing::PyFlagStat>().unwrap();
     m.add_function(wrap_pyfunction!(preprocessing::make_fragment_file, m)?)?;
     m.add_function(wrap_pyfunction!(preprocessing::import_fragments, m)?)?;
     m.add_function(wrap_pyfunction!(preprocessing::import_contacts, m)?)?;
@@ -57,6 +56,7 @@ fn _snapatac2(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(call_peaks::fetch_peaks, m)?)?;
     m.add_function(wrap_pyfunction!(call_peaks::py_merge_peaks, m)?)?;
     m.add_function(wrap_pyfunction!(call_peaks::find_reproducible_peaks, m)?)?;
+    m.add_function(wrap_pyfunction!(call_peaks::call_peaks_bulk, m)?)?;
 
     m.add_function(wrap_pyfunction!(knn::nearest_neighbour_graph, m)?)?;
     m.add_function(wrap_pyfunction!(knn::approximate_nearest_neighbour_graph, m)?)?;
@@ -72,6 +72,7 @@ fn _snapatac2(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(utils::read_regions, m)?)?;
     m.add_function(wrap_pyfunction!(utils::intersect_bed, m)?)?;
     m.add_function(wrap_pyfunction!(utils::kmeans, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::total_size_of_peaks, m)?)?;
     m.add_function(wrap_pyfunction!(embedding::spectral_embedding, m)?)?;
     m.add_function(wrap_pyfunction!(embedding::multi_spectral_embedding, m)?)?;
     m.add_function(wrap_pyfunction!(embedding::spectral_embedding_nystrom, m)?)?;
