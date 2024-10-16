@@ -6,7 +6,8 @@ use std::io::{BufWriter, Write};
 use std::str::FromStr;
 use anyhow::{Result, Context};
 
-use bed_utils::bed::{BEDLike, NarrowPeak, merge_bed_with};
+use bed_utils::bed::{BEDLike, NarrowPeak, merge_sorted_bed_with};
+use bed_utils::extsort::ExternalSorterBuilder;
 
 pub fn merge_peaks<I>(peaks: I, half_window_size: u64) -> impl Iterator<Item = Vec<NarrowPeak>>
 where
@@ -24,25 +25,26 @@ where
         result
     }
 
-    merge_bed_with(
-        peaks.map(move |mut x| {
-            let summit = x.start() + x.peak;
-            x.start = summit.saturating_sub(half_window_size);
-            x.end = summit + half_window_size + 1;
-            x.peak = summit - x.start;
-            x
-        }),
-        iterative_merge,
-        None::<&str>,
-    )
+    let input = peaks.map(move |mut x| {
+        let summit = x.start() + x.peak;
+        x.start = summit.saturating_sub(half_window_size);
+        x.end = summit + half_window_size + 1;
+        x.peak = summit - x.start;
+        std::io::Result::Ok(x)
+    });
+    let input = ExternalSorterBuilder::new()
+        .with_compression(2)
+        .build().unwrap()
+        .sort_by(input, BEDLike::compare).unwrap()
+        .map(|x| x.unwrap());
+    merge_sorted_bed_with(input, iterative_merge)
 }
 
 pub fn clip_peak(mut peak: NarrowPeak, chrom_sizes: &crate::preprocessing::count_data::ChromSizes) -> NarrowPeak {
     let chr = peak.chrom();
-    let new_start = peak.start().max(0);
-    let new_end = peak.end().min(
-        chrom_sizes.get(chr).expect(&format!("Size missing for chromosome: {}", chr))
-    );
+    let max_len = chrom_sizes.get(chr).expect(&format!("Size missing for chromosome: {}", chr));
+    let new_start = peak.start().max(0).min(max_len);
+    let new_end = peak.end().min(max_len);
     peak.set_start(new_start);
     peak.set_end(new_end);
     peak.peak = (new_start + peak.peak).min(new_end) - new_start;

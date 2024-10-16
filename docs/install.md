@@ -35,9 +35,9 @@ The nightly build is the build from the latest source codes, which includes the
 latest features, enhancements, and bug fixes that haven't been released. 
 The nightly build can be unstable and include some untested features.
 
-You need to download the appropriate
-{download}`wheel file <https://github.com/kaizhang/SnapATAC2/releases/tag/nightly>`
-for your platform and use `pip install` to install it.
+The [nightly release](https://github.com/kaizhang/SnapATAC2/releases/tag/nightly) page
+contains wheel files for the nightly build.
+Please download the corresponding wheel file for your platform and use `pip install` to install it.
 For example, if you are using a Linux system with Python 3.8, you can use the following command to install it:
 
 ```
@@ -77,11 +77,4 @@ For certain features, however, additional optional dependencies are necessary:
 - scanorama: For the `snapatac2.pp.scanorama_integrate` function.
 - xgboot: For network structure inference.
 
-To install these optional dependencies, use `pip install snapatac2[extra]`.
-
-For downstream analysis, some helpful but not mandatory packages, such as scanpy and scvi-tools, are available.
-They can be installed with `pip install snapatac2[recommend]`.
-
-To obtain all optional dependencies at once, use `pip install snapatac2[all]`.
-
-Note that the detailed dependencies of SnapATAC2 can be found in the [setup.py](https://github.com/kaizhang/SnapATAC2/blob/main/snapatac2-python/setup.py).
+To install these optional dependencies, use `pip install snapatac2[recommend]`.

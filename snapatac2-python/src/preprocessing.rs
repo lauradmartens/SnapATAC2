@@ -1,36 +1,25 @@
 use crate::utils::*;
 
+use itertools::Itertools;
+use nalgebra::coordinates::X;
+use pyo3::{prelude::*, pybacked::PyBackedStr};
 use anndata::Backend;
 use anndata_hdf5::H5;
 use snapatac2_core::preprocessing::count_data::TranscriptParserOptions;
 use snapatac2_core::preprocessing::count_data::CountingStrategy;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::{str::FromStr, collections::BTreeMap, ops::Deref, collections::HashSet};
-use pyo3::prelude::*;
 use bed_utils::{bed, bed::GenomicRange};
+use bed_utils::extsort::ExternalSorterBuilder;
 use pyanndata::PyAnnData;
 use anyhow::Result;
 
 use snapatac2_core::{
-    preprocessing::{Fragment, Contact, FlagStat, SnapData},
+    preprocessing::{Fragment, Contact, SnapData},
     preprocessing, utils,
 };
-
-#[pyclass]
-pub(crate) struct PyFlagStat(FlagStat);
-
-#[pymethods]
-impl PyFlagStat {
-    #[getter]
-    fn num_reads(&self) -> u64 { self.0.read }
-
-    fn __repr__(&self) -> String {
-        format!("{:?}", self.0)
-    }
-
-    fn __str__(&self) -> String { self.__repr__() }
-}
 
 #[pyfunction]
 pub(crate) fn make_fragment_file(
@@ -46,10 +35,13 @@ pub(crate) fn make_fragment_file(
     umi_tag: Option<&str>,
     umi_regex: Option<&str>,
     mapq: Option<u8>,
+    mitochondrial_dna: Option<Vec<String>>,
+    xf_filter: Option<bool>,
+    source: Option<&str>,
     compression: Option<&str>,
     compression_level: Option<u32>,
     temp_dir: Option<PathBuf>,
-) -> Result<PyFlagStat>
+) -> Result<HashMap<String, f64>>
 {
     fn parse_tag(tag: &str) -> [u8; 2] {
         let tag_b = tag.as_bytes();
@@ -59,21 +51,21 @@ pub(crate) fn make_fragment_file(
             panic!("TAG name must contain exactly two characters");
         }
     }
-    let stat = preprocessing::make_fragment_file(
+    let (bam_qc, frag_qc) = preprocessing::make_fragment_file(
         bam_file, output_file, is_paired, stranded,
         barcode_tag.map(|x| parse_tag(x)), barcode_regex,
         umi_tag.map(|x| parse_tag(x)), umi_regex,
-        shift_left, shift_right, mapq, chunk_size,
-        compression.map(|x| utils::Compression::from_str(x).unwrap()), compression_level, temp_dir
+        shift_left, shift_right, mapq, chunk_size, source, mitochondrial_dna.map(|x| x.into_iter().collect()), xf_filter,
+        compression.map(|x| utils::Compression::from_str(x).unwrap()), compression_level, temp_dir,
     )?;
-    Ok(PyFlagStat(stat))
+    Ok(bam_qc.report().into_iter().chain(frag_qc.report()).collect())
 }
 
 #[pyfunction]
 pub(crate) fn import_fragments(
     anndata: AnnDataLike,
     fragment_file: PathBuf,
-    chrom_size: BTreeMap<&str, u64>,
+    chrom_size: BTreeMap<String, u64>,
     mitochondrial_dna: Vec<String>,
     min_num_fragment: u64,
     fragment_is_sorted_by_name: bool,
@@ -103,15 +95,25 @@ pub(crate) fn import_fragments(
     };
     let chrom_sizes = chrom_size.into_iter().collect();
     let fragments = bed::io::Reader::new(utils::open_file_for_read(&fragment_file), Some("#".to_string()))
-        .into_records::<Fragment>().map(|x| {
-            let mut f = x.unwrap();
+        .into_records::<Fragment>().map(|x| x.map(|mut f| {
             shift_fragment(&mut f, shift_left, shift_right);
             f
-    });
+    }));
     let sorted_fragments: Box<dyn Iterator<Item = Fragment>> = if !fragment_is_sorted_by_name {
-        Box::new(bed::sort_bed_by_key(fragments, |x| x.barcode.clone(), tempdir))
+        let mut sorter = ExternalSorterBuilder::new()
+            .with_chunk_size(50000000)
+            .with_compression(2);
+        if let Some(tmp) = tempdir {
+            sorter = sorter.with_tmp_dir(tmp);
+        }
+        Box::new(sorter
+            .build().unwrap()
+            .sort_by(fragments, |a, b| a.barcode.cmp(&b.barcode))
+            .unwrap()
+            .map(Result::unwrap)
+        )
     } else {
-        Box::new(fragments)
+        Box::new(fragments.map(Result::unwrap))
     };
 
     macro_rules! run {
@@ -143,8 +145,9 @@ fn shift_fragment(fragment: &mut Fragment, shift_left: i64, shift_right: i64) {
 pub(crate) fn import_contacts(
     anndata: AnnDataLike,
     contact_file: PathBuf,
-    chrom_size: BTreeMap<&str, u64>,
+    chrom_size: BTreeMap<String, u64>,
     fragment_is_sorted_by_name: bool,
+    bin_size: usize,
     chunk_size: usize,
     tempdir: Option<PathBuf>,
 ) -> Result<()>
@@ -152,26 +155,27 @@ pub(crate) fn import_contacts(
     let chrom_sizes = chrom_size.into_iter().map(|(chr, s)| GenomicRange::new(chr, 0, s)).collect();
 
     let contacts = BufReader::new(utils::open_file_for_read(&contact_file)).lines()
-        .map(|x| Contact::from_str(&x.unwrap()).unwrap());
+        .map(|r| r.map(|x| Contact::from_str(&x).unwrap()));
     let sorted_contacts: Box<dyn Iterator<Item = Contact>> = if !fragment_is_sorted_by_name {
-        let tmp = if let Some(dir) = tempdir {
-            tempfile::Builder::new().tempdir_in(dir)
-        } else {
-            tempfile::tempdir()
-        }.expect("failed to create tmperorary directory");
-        Box::new(extsort::ExternalSorter::new()
-            .with_segment_size(50000000)
-            .with_sort_dir(tmp.path().to_path_buf())
-            .with_parallel_sort()
-            .sort_by_key(contacts, |x| x.barcode.clone()).unwrap()
+        let mut sorter = ExternalSorterBuilder::new()
+            .with_chunk_size(50000000)
+            .with_compression(2);
+        if let Some(tmp) = tempdir {
+            sorter = sorter.with_tmp_dir(tmp);
+        }
+        Box::new(sorter
+            .build().unwrap()
+            .sort_by(contacts, |a, b| a.barcode.cmp(&b.barcode))
+            .unwrap()
+            .map(Result::unwrap)
         )
     } else {
-        Box::new(contacts)
+        Box::new(contacts.map(Result::unwrap))
     };
 
     macro_rules! run {
         ($data:expr) => {
-            preprocessing::import_contacts($data, sorted_contacts, &chrom_sizes, chunk_size)?
+            preprocessing::import_contacts($data, sorted_contacts, &chrom_sizes, bin_size, chunk_size)?
         };
     }
 
@@ -195,12 +199,14 @@ pub(crate) fn mk_tile_matrix(
     bin_size: usize,
     chunk_size: usize,
     strategy: &str,
-    exclude_chroms: Option<Vec<&str>>,
+    exclude_chroms: Option<Vec<PyBackedStr>>,
     min_fragment_size: Option<u64>,
     max_fragment_size: Option<u64>,
     out: Option<AnnDataLike>
 ) -> Result<()>
 {
+    let exclude_chroms = exclude_chroms.as_ref()
+        .map(|s| s.iter().map(|x| x.as_ref()).collect::<Vec<_>>());
     macro_rules! run {
         ($data:expr) => {
             if let Some(out) = out {
@@ -241,7 +247,7 @@ pub(crate) fn mk_tile_matrix(
 #[pyfunction]
 pub(crate) fn mk_peak_matrix(
     anndata: AnnDataLike,
-    peaks: &PyAny,
+    peaks: Bound<'_, PyAny>,
     chunk_size: usize,
     use_x: bool,
     strategy: &str,
@@ -281,6 +287,9 @@ pub(crate) fn mk_gene_matrix(
     chunk_size: usize,
     use_x: bool,
     id_type: &str,
+    upstream: u64,
+    downstream: u64,
+    include_gene_body: bool,
     transcript_name_key: String,
     transcript_id_key: String,
     gene_name_key: String,
@@ -304,13 +313,15 @@ pub(crate) fn mk_gene_matrix(
             if let Some(out) = out {
                 macro_rules! run2 {
                     ($out_data:expr) => {
-                        preprocessing::create_gene_matrix($data, transcripts, id_type, chunk_size, strategy,
+                        preprocessing::create_gene_matrix($data, transcripts, id_type,
+                            upstream, downstream, include_gene_body, chunk_size, strategy,
                             min_fragment_size, max_fragment_size, Some($out_data), use_x)?
                     };
                 }
                 crate::with_anndata!(&out, run2);
             } else {
-                preprocessing::create_gene_matrix($data, transcripts, id_type, chunk_size, strategy,
+                preprocessing::create_gene_matrix($data, transcripts, id_type,
+                    upstream, downstream, include_gene_body, chunk_size, strategy,
                     min_fragment_size, max_fragment_size, None::<&PyAnnData>, use_x)?;
             }
         }
@@ -322,25 +333,43 @@ pub(crate) fn mk_gene_matrix(
 /// QC metrics
 
 #[pyfunction]
-pub(crate) fn tss_enrichment(
+pub(crate) fn tss_enrichment<'py>(
+    py: Python<'py>,
     anndata: AnnDataLike,
     gtf_file: PathBuf,
-) -> Result<Vec<f64>>
+    exclude_chroms: Option<Vec<String>>,
+) -> Result<HashMap<&'py str, PyObject>>
 {
-    let promoters = preprocessing::make_promoter_map(preprocessing::read_tss(utils::open_file_for_read(gtf_file)));
+    let exclude_chroms = match exclude_chroms {
+        Some(chrs) => chrs.into_iter().collect(),
+        None => HashSet::new(), 
+    };
+    let tss = preprocessing::read_tss(utils::open_file_for_read(gtf_file))
+        .unique()
+        .filter(|(chr, _, _)| !exclude_chroms.contains(chr));
+    let promoters = preprocessing::TssRegions::new(tss, 2000);
 
     macro_rules! run {
         ($data:expr) => {
             $data.tss_enrichment(&promoters)
         }
     }
-    crate::with_anndata!(&anndata, run)
+    let (scores, tsse) = crate::with_anndata!(&anndata, run)?;
+    let library_tsse = tsse.result();
+    let mut result = HashMap::new();
+    result.insert("tsse", scores.to_object(py));
+    result.insert("library_tsse", library_tsse.0.to_object(py));
+    result.insert("frac_overlap_TSS", library_tsse.1.to_object(py));
+    result.insert("TSS_profile", tsse.get_counts().to_object(py));
+    Ok(result)
 }
 
 #[pyfunction]
 pub(crate) fn add_frip(
     anndata: AnnDataLike,
-    regions: BTreeMap<String, Vec<&str>>,
+    regions: BTreeMap<String, Vec<String>>,
+    normalized: bool,
+    count_as_insertion: bool,
 ) -> Result<BTreeMap<String, Vec<f64>>>
 {
     let trees: Vec<_> = regions.values().map(|x|
@@ -349,7 +378,7 @@ pub(crate) fn add_frip(
 
     macro_rules! run {
         ($data:expr) => {
-            $data.frip(&trees)
+            $data.frip(&trees, normalized, count_as_insertion)
         }
     }
 

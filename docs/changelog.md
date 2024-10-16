@@ -1,21 +1,78 @@
 # Release Notes
 
-## Nightly version
+## Nightly
 
 ### Features:
+
+  - Implement barcode correction algorithms.
+
+### Bugs fixed:
+
+  - Fix #335: GTF parsing error when textual attributes contain semicolons.
+
+### Features:
+
+## Release 2.7.0 (released August 27, 2024)
+
+### Features:
+
+  - Return more QC metrics from `pp.make_fragment_file`.
+  - Also compute library-level TSSe in `metrics.tsse`.
+  - `pp.make_fragment_file` can now work with 10X BAM files by specifying `source=10x`.
+  - Add `pp.call_cells` to identify nonempty barcodes from raw data.
+  - Add `pp.recipe_10x_metrics` to compute 10X metrics.
+  - Add `pp.import_contacts` to process scHi-C data.
+  - Implement pseudo-bulk peak calling in `tl.macs3`.
+
+### Other Changes:
+
+  - Change the default counting strategy from "insertion" to "paired-insertion" in
+    `pp.add_tile_matrix`, `pp.make_peak_matrix`, `pp.make_gene_matrix`.
+  - Minor changes in TSSe calculation.
+
+## Release 2.6.4 (released May 28, 2024)
+
+### Features:
+
+  - Implement #304: Add some flexibility to `pp.make_gene_matrix` by allowing the user to change
+    upstream and downstream distances for TSS calculation.
+  - Other minor improvements.
+
+## Release 2.6.3 (released May 15, 2024)
+
+### Bugs fixed:
+
+  - Fixed external sorter issues in version 2.6.2.
+
+## Release 2.6.2 (released May 9, 2024)
+
+### Features:
+
+  - Add the argument `exclude_chroms` to `metrics.tsse` to exclude certains chromosomes
+    from TSSe calculation. The default is "chrM".
+
+## Release 2.6.1 (released May 2, 2024)
+
+### Features:
+
   - Add the argument `inplace` to AnnData `subset` function. As a result, if you
     want to perform out-of-place subset, you need to set `inplace=False` explicitly.
     Before you just need to set the `out` parameter. The benefit of this change
     is that you can save the subset in memory by setting `out=None, inplace=False`,
     which cannot be achieved before.
+  - Use only the unique TSSs instead of all TSSs read from the GTF file in `metrics.tsse` calculation.
 
 ### Bugs fixed:
+
   - Fix #252: `tl.spectral` does not raise an error when the input matrix is in
     compressed column format, whereas it should expect a compressed sparse row format.
+  - Fix a bug in `pp.import_data` which produces incorrect duplication rates when
+    the input data contains mitochondrial reads.
 
 ## Release 2.6.0 (released March 9, 2024)
 
 ### Features:
+
   - Add a argument `counting_strategy` to `pp.add_tile_matrix`, `pp.make_peak_matrix`, and `pp.make_gene_matrix`, which allows one to use different strategies
   (insertion-based, fragment-based, or paired insertion counting) to compute feature counts.
   - Fix #233: Add Apple silicon wheel files.

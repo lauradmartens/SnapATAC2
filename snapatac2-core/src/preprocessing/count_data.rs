@@ -22,7 +22,9 @@ use polars::frame::DataFrame;
 use nalgebra_sparse::CsrMatrix;
 use anyhow::{Result, Context, bail};
 use num::integer::div_ceil;
-use std::str::FromStr;
+use std::{str::FromStr, sync::{Arc, Mutex}};
+
+use self::qc::TSSe;
 
 /// The `SnapData` trait represents an interface for reading and
 /// manipulating single-cell assay data. It extends the `AnnDataOp` trait,
@@ -47,8 +49,6 @@ pub trait SnapData: AnnDataOp {
     fn get_count_iter(&self, chunk_size: usize) ->
         Result<GenomeCount<Box<dyn ExactSizeIterator<Item = (FragmentType, usize, usize)>>>>;
 
-    fn contact_count_iter(&self, chunk_size: usize) -> Result<ContactMap<Self::CountIter>>;
-
     /// Read counts stored in the `X` matrix.
     fn read_chrom_values(
         &self,
@@ -71,22 +71,32 @@ pub trait SnapData: AnnDataOp {
     /// QC metrics for the data.
 
     /// Compute TSS enrichment.
-    fn tss_enrichment(&self, promoter: &BedTree<bool>) -> Result<Vec<f64>> {
-        Ok(self.get_count_iter(2000)?.into_fragments().flat_map(|(fragments, _, _)| {
-            fragments.into_par_iter()
-                .map(|x| qc::tss_enrichment(x.into_iter(), promoter))
-                .collect::<Vec<_>>()
-        }).collect())
+    fn tss_enrichment<'a>(&self, promoter: &'a qc::TssRegions) -> Result<(Vec<f64>, TSSe<'a>)> {
+        let library_tsse = Arc::new(Mutex::new(qc::TSSe::new(promoter)));
+        let scores = self.get_count_iter(2000)?.into_fragments().flat_map(|(list_of_fragments, _, _)| {
+            list_of_fragments.into_par_iter().map(|fragments| {
+                let mut tsse = qc::TSSe::new(promoter);
+                fragments.into_iter().for_each(|x| tsse.add(&x));
+                library_tsse.lock().unwrap().add_from(&tsse);
+                tsse.result().0
+            }).collect::<Vec<_>>()
+        }).collect();
+        Ok((scores, Arc::into_inner(library_tsse).unwrap().into_inner().unwrap()))
     }
 
     /// Compute the fragment size distribution.
     fn fragment_size_distribution(&self, max_size: usize) -> Result<Vec<usize>>;
 
     /// Compute the fraction of reads in each region.
-    fn frip<D>(&self, regions: &Vec<BedTree<D>>) -> Result<Array2<f64>> {
-        let vec = qc::fraction_of_reads_in_region(self.get_count_iter(2000)?.into_fragments(), regions)
-            .map(|x| x.0).flatten().flatten().collect::<Vec<_>>();
+    fn frip<D>(&self, regions: &Vec<BedTree<D>>, normalized: bool, count_as_insertion: bool) -> Result<Array2<f64>> {
+        let vec = qc::fraction_of_reads_in_region(
+            self.get_count_iter(2000)?.into_fragments(), regions, normalized, count_as_insertion,
+        ).map(|x| x.0).flatten().flatten().collect::<Vec<_>>();
         Array2::from_shape_vec((self.n_obs(), regions.len()), vec).map_err(Into::into)
+    }
+
+    fn genome_size(&self) -> Result<u64> {
+        Ok(self.read_chrom_sizes()?.total_size())
     }
 }
 
@@ -106,13 +116,6 @@ impl<B: Backend> SnapData for AnnData<B> {
                 anyhow::bail!("neither 'fragment_single' nor 'fragment_paired' is present in the '.obsm'")
             };
         Ok(GenomeCount::new(self.read_chrom_sizes()?, matrices))
-    }
-
-    fn contact_count_iter(&self, chunk_size: usize) -> Result<ContactMap<Self::CountIter>> {
-        Ok(ContactMap::new(
-            self.read_chrom_sizes()?,
-            self.obsm().get_item_iter("contact", chunk_size).unwrap(),
-        ))
     }
 
     fn fragment_size_distribution(&self, max_size: usize) -> Result<Vec<usize>> {
@@ -141,17 +144,6 @@ impl<B: Backend> SnapData for AnnDataSet<B> {
                 anyhow::bail!("neither 'fragment_single' nor 'fragment_paired' is present in the '.obsm'")
             };
         Ok(GenomeCount::new(self.read_chrom_sizes()?, matrices))
-    }
-
-    fn contact_count_iter(&self, chunk_size: usize) -> Result<ContactMap<Self::CountIter>> {
-        Ok(ContactMap::new(
-            self.read_chrom_sizes()?,
-            self.adatas()
-                .inner()
-                .get_obsm()
-                .get_item_iter("contact", chunk_size)
-                .unwrap(),
-        ))
     }
 
     fn fragment_size_distribution(&self, max_size: usize) -> Result<Vec<usize>> {
