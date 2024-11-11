@@ -1,16 +1,16 @@
 # Release Notes
 
-## Nightly
+## Release 2.7.1 (released October 29, 2024)
 
 ### Features:
 
   - Implement barcode correction algorithms.
+  - Add `smooth_length` to `ex.export_coverage`.
 
 ### Bugs fixed:
 
   - Fix #335: GTF parsing error when textual attributes contain semicolons.
-
-### Features:
+  - Fix #347: Add file name sanity check in various places.
 
 ## Release 2.7.0 (released August 27, 2024)
 
