@@ -42,7 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
-    if: ${{ startsWith(github.ref, 'refs/tags') }}
+    # if: ${{ startsWith(github.ref, 'refs/tags') }}
     steps:
     - name: Download wheel files
       uses: actions/download-artifact@v4
@@ -53,6 +53,8 @@ jobs:
 
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@v1.8.14
+      with:
+        repository-url: https://test.pypi.org/legacy/
 
 #  build-docker:
 #    needs: [build-and-test, build-wheel]
