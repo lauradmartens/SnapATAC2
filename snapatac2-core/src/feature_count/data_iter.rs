@@ -40,7 +40,7 @@ fn single_to_fragments(
                 let row_end = row_offsets[i + 1];
                 (row_start..row_end)
                     .flat_map(|j| {
-                        let (chrom, start) = index.get_position(col_indices[j]);
+                        let (chrom, mut start) = index.get_position(col_indices[j]);
                         if exclude_chroms.contains(chrom) {
                             None
                         } else {
